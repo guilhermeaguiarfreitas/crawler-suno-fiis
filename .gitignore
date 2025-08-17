@@ -1,0 +1,17 @@
+# Arquivos de Segredos e Credenciais - NUNCA ENVIE ISSO!
+.env
+serviceaccount.json
+
+# Arquivos de Cache e Checkpoints do Python e Jupyter
+__pycache__/
+.ipynb_checkpoints/
+
+# Dependências do Python (geralmente gerenciadas via requirements.txt)
+venv/
+.venv/
+env/
+.env/
+
+# Arquivos de IDEs
+.vscode/
+.idea/

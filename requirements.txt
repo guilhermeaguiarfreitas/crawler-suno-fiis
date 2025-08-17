@@ -1,0 +1,10 @@
+pandas
+selenium
+gspread
+oauth2client
+df2gspread
+webdriver-manager
+requests
+beautifulsoup4
+python-dotenv
+pyarrow 
