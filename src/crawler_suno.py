@@ -2,11 +2,10 @@
 import sys
 import time
 from datetime import datetime
-from io import StringIO
+from io import StringIO, BytesIO
 import gspread
 import pandas as pd
 import requests
-import yfinance as yf
 from bs4 import BeautifulSoup
 from df2gspread import df2gspread as d2g
 from oauth2client.service_account import ServiceAccountCredentials
@@ -19,6 +18,9 @@ from webdriver_manager.chrome import ChromeDriverManager
 import os
 from dotenv import load_dotenv
 import warnings
+import boto3
+from botocore.client import Config
+from botocore.exceptions import ClientError
 
 # Suprime todos os warnings para uma saída mais limpa
 warnings.filterwarnings('ignore')
@@ -35,11 +37,15 @@ SUNO_USERNAME = os.getenv('SUNO_USERNAME')
 SUNO_PASSWORD = os.getenv('SUNO_PASSWORD')
 BRAPI_TOKEN = os.getenv('BRAPI_TOKEN')
 GOOGLE_SHEETS_KEY = os.getenv('GOOGLE_SHEETS_KEY')
-
-# --- Caminhos de Arquivos e Nomes ---
-PARQUET_FILE_PATH = os.getenv('PARQUET_FILE_PATH')
 GSPREAD_CREDENTIALS_PATH = os.getenv('GSPREAD_CREDENTIALS_PATH')
 GSHEET_WORKSHEET_NAME = 'Carteira_Suno'
+
+# --- Configurações do MinIO ---
+MINIO_ENDPOINT = os.getenv('MINIO_ENDPOINT')
+MINIO_ACCESS_KEY = os.getenv('MINIO_ACCESS_KEY')
+MINIO_SECRET_KEY = os.getenv('MINIO_SECRET_KEY')
+MINIO_BUCKET = os.getenv('MINIO_BUCKET')
+PARQUET_OBJECT_NAME = os.getenv('PARQUET_OBJECT_NAME')
 
 # --- URLs e Endpoints ---
 SUNO_LOGIN_URL = 'https://login.suno.com.br/entrar/cef02de7-1e5a-4b0e-9f41-04e9278aa2d7/'
@@ -53,8 +59,6 @@ GSPREAD_SCOPES = [
     'https://www.googleapis.com/auth/drive.file',
     'https://www.googleapis.com/auth/spreadsheets'
 ]
-
-
 
 # %%
 def setup_webdriver() -> webdriver.Chrome:
@@ -74,7 +78,7 @@ def setup_webdriver() -> webdriver.Chrome:
         
     return webdriver.Chrome(service=service, options=chrome_options)
 
-
+        
 def scrape_suno_portfolio(driver: webdriver.Chrome) -> pd.DataFrame:
     """Realiza o login no site da Suno e extrai os dados da carteira de FIIs."""
     print("Iniciando scraping da carteira Suno FIIs...")
@@ -159,22 +163,86 @@ def fetch_historical_prices(tickers: list) -> pd.DataFrame:
     return hist_1m[['ticker', 'date', 'open', 'high', 'low', 'close', 'volume']]
 
 
-def update_historical_data_file(file_path: str, new_data_df: pd.DataFrame):
-    """Lê, atualiza e salva o arquivo Parquet com os dados históricos consolidados."""
-    print(f"\nAtualizando arquivo de dados históricos em: {file_path}")
+def setup_minio_client(minio_config):
+    """Configura e retorna o cliente para se conectar ao Minio."""
+    if not all(minio_config.values()):
+        print("ERRO: Configurações do Minio incompletas. Verifique o arquivo .env")
+        return None
+    
     try:
-        historical_df = pd.read_parquet(file_path)
-    except FileNotFoundError:
-        print("Arquivo Parquet não encontrado. Um novo será criado.")
-        historical_df = pd.DataFrame()
+        # Cria o cliente S3
+        client = boto3.client(
+            's3',
+            endpoint_url=minio_config['endpoint'],
+            aws_access_key_id=minio_config['access_key'],
+            aws_secret_access_key=minio_config['secret_key'],
+            config=Config(signature_version='s3v4')
+        )
+        # Verifica se o bucket existe, senão cria
+        try:
+            client.head_bucket(Bucket=minio_config['bucket'])
+        except ClientError:
+            print(f"Bucket '{minio_config['bucket']}' não encontrado. Criando...")
+            client.create_bucket(Bucket=minio_config['bucket'])
+        return client
+    except Exception as e:
+        print(f"ERRO: Não foi possível conectar ao Minio. Detalhe: {e}")
+        return None
 
+def update_parquet_in_minio(new_data_df: pd.DataFrame):
+    """Lê, atualiza e salva o arquivo Parquet no MinIO usando boto3."""
+    
+    # Monta o dicionário de configuração a partir das variáveis de ambiente
+    minio_config = {
+        'endpoint': MINIO_ENDPOINT,
+        'access_key': MINIO_ACCESS_KEY,
+        'secret_key': MINIO_SECRET_KEY,
+        'bucket': MINIO_BUCKET
+    }
+    
+    s3_client = setup_minio_client(minio_config)
+    
+    if not s3_client:
+        print("-> Cliente Minio não configurado. Pulando salvamento.")
+        return
+        
+    print(f"\nAtualizando arquivo Parquet no MinIO (Bucket: {MINIO_BUCKET})...")
+    
+    try:
+        # 1. LER o objeto existente do MinIO
+        response = s3_client.get_object(Bucket=MINIO_BUCKET, Key=PARQUET_OBJECT_NAME)
+        # Ler o conteúdo do objeto em um buffer de memória
+        buffer = BytesIO(response['Body'].read())
+        historical_df = pd.read_parquet(buffer)
+        print("Arquivo Parquet existente lido do MinIO.")
+
+    except ClientError as e:
+        # Se o erro for 'NoSuchKey', significa que o arquivo não existe (primeira execução)
+        if e.response['Error']['Code'] == 'NoSuchKey':
+            print("Arquivo Parquet não encontrado no MinIO. Um novo será criado.")
+            historical_df = pd.DataFrame()
+        else:
+            # Para outros erros, lança a exceção
+            print(f"ERRO ao ler do MinIO: {e}")
+            raise
+
+    # 2. COMBINAR os dataframes (lógica mantida)
     combined_df = pd.concat([historical_df, new_data_df], ignore_index=True)
     combined_df.drop_duplicates(subset=['ticker', 'date'], keep='first', inplace=True)
     combined_df.reset_index(drop=True, inplace=True)
     
-    combined_df.to_parquet(file_path)
-    print("Arquivo Parquet atualizado com sucesso.")
-
+    # 3. ESCREVER o novo dataframe de volta para o MinIO
+    # Converter o dataframe para o formato parquet em um buffer de memória
+    out_buffer = BytesIO()
+    combined_df.to_parquet(out_buffer, index=False)
+    
+    # Enviar os bytes do buffer para o MinIO
+    s3_client.put_object(
+        Bucket=MINIO_BUCKET, 
+        Key=PARQUET_OBJECT_NAME, 
+        Body=out_buffer.getvalue()
+    )
+    print("Arquivo Parquet atualizado com sucesso no MinIO.")
 
 def upload_to_google_sheets(suno_df: pd.DataFrame):
     """Autentica e envia os dados da carteira para a planilha do Google."""
@@ -225,11 +293,11 @@ def main():
         tickers = suno_portfolio_df['ticker'].tolist()
         historical_prices_df = fetch_historical_prices(tickers)
         
-        # 3. Atualizar arquivo Parquet local
+        # 3. Atualizar arquivo Parquet no data lake
         if not historical_prices_df.empty:
-            update_historical_data_file(PARQUET_FILE_PATH, historical_prices_df)
+            update_parquet_in_minio(historical_prices_df)
         else:
-            print("\nNenhum dado histórico foi baixado. O arquivo Parquet não será atualizado.")
+            print("\nNenhum dado histórico foi baixado. O arquivo no MinIO não será atualizado.")
 
         # 4. Enviar dados para o Google Sheets
         upload_to_google_sheets(suno_portfolio_df)

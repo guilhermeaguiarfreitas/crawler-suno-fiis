@@ -7,4 +7,6 @@ webdriver-manager
 requests
 beautifulsoup4
 python-dotenv
-pyarrow 
+pyarrow
+boto3
+botocore
